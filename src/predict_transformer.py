@@ -32,9 +32,20 @@ class TransformerSentimentPredictor:
     def predict(self, text: str):
         clean = light_clean(text)
         inputs = self.tokenizer(
-            clean, truncation=True, padding="max_length",
-            max_length=self.max_length, return_tensors="pt",
-        ).to(self.device)
+            clean,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+
+        # DistilBERT does not accept token_type_ids, although some tokenizers
+        # may return that field. Remove it before forwarding the batch.
+        inputs.pop("token_type_ids", None)
+        inputs = {
+            key: value.to(self.device)
+            for key, value in inputs.items()
+        }
 
         logits = self.model(**inputs).logits
         probs = F.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
