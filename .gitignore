@@ -1,7 +1,21 @@
-opinionmetrixai 
-models
+# Local environments and secrets
+.venv/
+venv/
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Downloaded model artifacts
+models/
+
+# Local data and generated files
 data/reviews.csv
-.streamlit
+*.log
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# Certificates and private infrastructure files
 src/ca.pem
 src/cloud.py
