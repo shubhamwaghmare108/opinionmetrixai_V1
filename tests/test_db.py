@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import MagicMock
 
 import db
@@ -22,12 +23,16 @@ def test_save_prediction_returns_true_and_uses_parameterized_values(monkeypatch)
     assert params == ("Great product", "Positive", 0.9, 0.08, 0.02, None)
 
 
-def test_save_prediction_returns_false_when_database_fails(monkeypatch):
-    monkeypatch.setattr(db, "get_connection", lambda: (_ for _ in ()).throw(RuntimeError("database unavailable")))
-    warning = MagicMock()
-    monkeypatch.setattr(db.st, "warning", warning)
+def test_save_prediction_returns_false_when_database_fails(monkeypatch, caplog):
+    monkeypatch.setattr(
+        db,
+        "get_connection",
+        lambda: (_ for _ in ()).throw(RuntimeError("database unavailable")),
+    )
 
-    result = db.save_prediction("Review", "Neutral", {})
+    with caplog.at_level(logging.ERROR, logger="db"):
+        result = db.save_prediction("Review", "Neutral", {})
 
     assert result is False
-    warning.assert_called_once()
+    assert "Prediction persistence failed" in caplog.text
+    assert "database unavailable" in caplog.text
