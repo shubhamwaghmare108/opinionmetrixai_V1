@@ -1,12 +1,17 @@
-import os
+"""Optional MySQL persistence for prediction results."""
+
+from __future__ import annotations
+
+import logging
 import tempfile
-from typing import Optional
+from typing import Any
 
 import pymysql
 import streamlit as st
 
+logger = logging.getLogger(__name__)
 _connection = None
-_ssl_cert_path: Optional[str] = None
+_ssl_cert_path: str | None = None
 
 
 def get_connection():
@@ -19,17 +24,18 @@ def get_connection():
         except Exception:
             _connection = None
 
-    if "connections" not in st.secrets or "mysql" not in st.secrets["connections"]:
+    connections = st.secrets.get("connections", {})
+    mysql_secrets = connections.get("mysql") if hasattr(connections, "get") else None
+    if not mysql_secrets:
         raise RuntimeError("MySQL secrets are not configured.")
 
-    mysql_secrets = st.secrets["connections"]["mysql"]
     ssl_dict = None
     cert_content = mysql_secrets.get("ssl_ca")
     if cert_content:
         if _ssl_cert_path is None:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as f:
-                f.write(str(cert_content))
-                _ssl_cert_path = f.name
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False, encoding="utf-8") as handle:
+                handle.write(str(cert_content))
+                _ssl_cert_path = handle.name
         ssl_dict = {"ca": _ssl_cert_path}
 
     _connection = pymysql.connect(
@@ -45,11 +51,11 @@ def get_connection():
     return _connection
 
 
-def save_prediction(review, sentiment, probabilities) -> bool:
-    """Persist a prediction; return False instead of breaking the UI."""
+def save_prediction(review: str, sentiment: str, probabilities: dict[str, float]) -> bool:
+    """Persist a prediction when MySQL is configured; otherwise return False."""
     try:
-        conn = get_connection()
-        with conn.cursor() as cursor:
+        connection = get_connection()
+        with connection.cursor() as cursor:
             cursor.execute(
                 """
                 INSERT INTO Prediction
@@ -59,13 +65,13 @@ def save_prediction(review, sentiment, probabilities) -> bool:
                 (
                     review,
                     sentiment,
-                    probabilities.get("Positive", 0),
-                    probabilities.get("Neutral", 0),
-                    probabilities.get("Negative", 0),
+                    probabilities.get("Positive", 0.0),
+                    probabilities.get("Neutral", 0.0),
+                    probabilities.get("Negative", 0.0),
                     None,
                 ),
             )
         return True
-    except Exception as exc:
-        st.warning(f"Prediction was generated, but it was not saved to the database: {exc}")
+    except Exception:
+        logger.exception("Prediction persistence failed")
         return False
