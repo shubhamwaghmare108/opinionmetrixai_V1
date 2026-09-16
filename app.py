@@ -1,16 +1,23 @@
-"""
-OpinionMetrix AI sentiment-analysis Streamlit application.
+"""OpinionMetrix AI sentiment-analysis Streamlit application."""
 
-Run:
-    streamlit run app.py
-"""
+from __future__ import annotations
 
-import os
 import sys
+from pathlib import Path
 
 import altair as alt
 import pandas as pd
 import streamlit as st
+
+APP_ROOT = Path(__file__).resolve().parent
+SRC_DIR = APP_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from db import save_prediction  # noqa: E402
+from download_models import download_models  # noqa: E402
+from predict_transformer import TransformerSentimentPredictor as SentimentPredictor  # noqa: E402
+from styles import inject_css, render_header, render_result_card, sentiment_color  # noqa: E402
 
 st.set_page_config(
     page_title="OpinionMetrix AI Sentiment Transformer",
@@ -19,22 +26,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
-from db import save_prediction
-from download_models import download_models
-from predict_transformer import TransformerSentimentPredictor as SentimentPredictor
-from styles import inject_css, render_header, render_result_card, sentiment_color
-
-
-@st.cache_resource
-def setup_models():
-    download_models()
-
-
-@st.cache_resource
+@st.cache_resource(show_spinner=False)
 def load_predictor():
-    return SentimentPredictor()
+    model_dir = download_models()
+    return SentimentPredictor(model_dir=model_dir)
 
 
 inject_css()
@@ -44,12 +40,7 @@ if "history" not in st.session_state:
 if "sample_text" not in st.session_state:
     st.session_state["sample_text"] = ""
 
-
-# ----------------------------------------------------------------------
-# Model loading
-# ----------------------------------------------------------------------
 try:
-    setup_models()
     predictor = load_predictor()
     model_loaded = True
     model_error = None
@@ -58,10 +49,6 @@ except Exception as exc:
     model_loaded = False
     model_error = str(exc)
 
-
-# ----------------------------------------------------------------------
-# Sidebar
-# ----------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ℹ️ About this model")
     st.write(
@@ -80,8 +67,8 @@ with st.sidebar:
         "Terrible quality, broke within a week, avoid this seller.",
         "It's fine, does what it says but nothing more.",
     ]
-    for sample in samples:
-        if st.button(sample, key=f"sample_{sample}"):
+    for index, sample in enumerate(samples):
+        if st.button(sample, key=f"sample_{index}"):
             st.session_state["sample_text"] = sample
             st.rerun()
 
@@ -102,19 +89,12 @@ with st.sidebar:
     else:
         st.caption("Your last few predictions will show up here.")
 
-
-# ----------------------------------------------------------------------
-# Main content
-# ----------------------------------------------------------------------
 render_header()
 
 if not model_loaded:
     st.error("The sentiment model could not be loaded.")
+    st.warning("The model download or validation step failed. Check the deployment logs for the underlying error.")
     st.code(model_error or "Unknown model-loading error")
-    st.info(
-        "Ensure the Google Drive model folder downloads a complete "
-        "models/transformer directory containing config.json and label_encoder.pkl."
-    )
     st.stop()
 
 st.markdown('<div class="input-card">', unsafe_allow_html=True)
@@ -137,14 +117,21 @@ if predict_clicked:
     if not text_input.strip():
         st.warning("Please enter a review to analyze.")
     else:
-        with st.spinner("Analyzing sentiment..."):
-            result = predictor.predict(text_input)
+        try:
+            with st.spinner("Analyzing sentiment..."):
+                result = predictor.predict(text_input)
+        except Exception:
+            st.error("Prediction failed. Check the application logs for details.")
+            st.stop()
 
         sentiment = result["sentiment"]
         confidence = result["confidence"]
         probs = result["probabilities"]
 
-        save_prediction(text_input, sentiment, probs)
+        try:
+            save_prediction(text_input, sentiment, probs)
+        except Exception:
+            st.warning("Prediction was generated, but database persistence failed.")
 
         st.session_state["history"].append(
             {
@@ -156,12 +143,11 @@ if predict_clicked:
         st.session_state["sample_text"] = ""
 
         render_result_card(sentiment, confidence)
-
         st.markdown("#### Prediction breakdown")
+
         df = pd.DataFrame(
             {"Label": list(probs.keys()), "Probability": list(probs.values())}
         ).sort_values("Probability", ascending=True)
-
         color_scale = alt.Scale(
             domain=["Positive", "Negative", "Neutral"],
             range=["#34d399", "#f87171", "#fbbf24"],
@@ -170,17 +156,10 @@ if predict_clicked:
             alt.Chart(df)
             .mark_bar(cornerRadiusTopRight=8, cornerRadiusBottomRight=8, height=26)
             .encode(
-                x=alt.X(
-                    "Probability:Q",
-                    axis=alt.Axis(format="%"),
-                    scale=alt.Scale(domain=[0, 1]),
-                ),
+                x=alt.X("Probability:Q", axis=alt.Axis(format="%"), scale=alt.Scale(domain=[0, 1])),
                 y=alt.Y("Label:N", sort="-x", title=None),
                 color=alt.Color("Label:N", scale=color_scale, legend=None),
-                tooltip=[
-                    alt.Tooltip("Label:N"),
-                    alt.Tooltip("Probability:Q", format=".1%"),
-                ],
+                tooltip=[alt.Tooltip("Label:N"), alt.Tooltip("Probability:Q", format=".1%")],
             )
             .properties(height=120)
         )
