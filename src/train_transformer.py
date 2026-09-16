@@ -1,84 +1,48 @@
-"""
-train_transformer.py
-----------------------
-Bonus phase of the Sentiment Analysis pipeline: fine-tune a pretrained
-Transformer (DistilBERT / BERT / RoBERTa) as a stronger alternative to the
-classical TF-IDF + ML models trained in train_model.py.
+"""Fine-tune a pretrained Transformer for sentiment classification."""
 
-Unlike the classical pipeline, Transformers work best on lightly-cleaned,
-near-raw text (they have their own subword tokenizer and rely on casing/
-punctuation/word order for context) - so this script uses a separate, minimal
-cleaning step instead of the stemmed/lemmatized `clean_review` column.
-
-Run:
-    python train_transformer.py
-    python train_transformer.py --model bert-base-uncased --epochs 4
-    python train_transformer.py --model roberta-base
-
-Outputs (written to ../models/transformer/):
-    pytorch_model.bin / model.safetensors + config.json   (fine-tuned model)
-    tokenizer files (vocab, tokenizer_config.json, etc.)
-    label_encoder.pkl                                     (class <-> id map)
-    evaluation_report.txt                                 (metrics)
-"""
+from __future__ import annotations
 
 import argparse
-import os
-import re
-import sys
 import time
+from pathlib import Path
 
 import joblib
 import numpy as np
-import pandas as pd
 import torch
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, classification_report,
-)
 from torch.utils.data import Dataset
 from transformers import (
-    AutoTokenizer,
     AutoModelForSequenceClassification,
+    AutoTokenizer,
+    EarlyStoppingCallback,
     Trainer,
     TrainingArguments,
-    EarlyStoppingCallback,
 )
 
-#sys.path.append(".")
 from data_preprocessing import load_data
 from logging_config import get_logger
+from transformer_text import light_clean
 
 logger = get_logger(__name__)
-
 RANDOM_STATE = 42
-
-# Any of these work out of the box - swap via --model:
-#   distilbert-base-uncased   (fast, ~66M params, good default)
-#   bert-base-uncased         (~110M params, classic baseline)
-#   roberta-base               (~125M params, usually the strongest of the three)
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_DATA = REPO_ROOT / "data" / "reviews.csv"
+DEFAULT_MODEL_DIR = REPO_ROOT / "models" / "transformer"
+DEFAULT_CHECKPOINT_DIR = REPO_ROOT / "models" / "transformer_checkpoints"
 DEFAULT_MODEL = "distilbert-base-uncased"
-
-URL_RE = re.compile(r"https?://\S+|www\.\S+")
-HTML_RE = re.compile(r"<.*?>")
-
-
-# ---------------------------------------------------------------------------
-# Minimal cleaning - keep casing/punctuation, only strip noise the tokenizer
-# can't usefully interpret (HTML tags, raw URLs, extra whitespace).
-# ---------------------------------------------------------------------------
-def light_clean(text: str) -> str:
-    text = str(text)
-    text = HTML_RE.sub(" ", text)
-    text = URL_RE.sub(" ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
 class ReviewDataset(Dataset):
-    """Wraps tokenized encodings + labels for the HuggingFace Trainer."""
+    """Tokenized reviews plus integer labels for Hugging Face Trainer."""
 
     def __init__(self, encodings, labels):
         self.encodings = encodings
@@ -88,12 +52,13 @@ class ReviewDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        item = {k: v[idx] for k, v in self.encodings.items()}
-        item["labels"] = torch.tensor(self.labels[idx])
+        item = {key: value[idx] for key, value in self.encodings.items()}
+        item["labels"] = torch.tensor(self.labels[idx], dtype=torch.long)
         return item
 
 
 def compute_metrics(eval_pred):
+    """Compute weighted validation metrics."""
     logits, labels = eval_pred
     preds = np.argmax(logits, axis=1)
     return {
@@ -104,73 +69,86 @@ def compute_metrics(eval_pred):
     }
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Fine-tune a pretrained Transformer for sentiment classification.")
-    p.add_argument("--model", default=DEFAULT_MODEL,
-                    help="HuggingFace checkpoint: distilbert-base-uncased | bert-base-uncased | roberta-base")
-    p.add_argument("--epochs", type=int, default=3)
-    p.add_argument("--batch-size", type=int, default=16)
-    p.add_argument("--max-length", type=int, default=128)
-    p.add_argument("--lr", type=float, default=2e-5)
-    p.add_argument("--data", default="../data/reviews.csv")
-    p.add_argument("--out-dir", default="../models/transformer")
-    return p.parse_args()
+def parse_args(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Fine-tune a Transformer for sentiment classification.")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-length", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    parser.add_argument("--out-dir", type=Path, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
-    t0 = time.time()
-    report_lines = [f"Model: {args.model}", f"Epochs: {args.epochs}", f"Max length: {args.max_length}"]
+def validate_args(args) -> None:
+    if args.epochs < 1:
+        raise ValueError("--epochs must be >= 1")
+    if args.batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if args.max_length < 1:
+        raise ValueError("--max-length must be >= 1")
+    if args.lr <= 0:
+        raise ValueError("--lr must be > 0")
 
-    device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    logger.info(f"Using device: {device}")
-    logger.info(f"Model: {args.model} | Epochs: {args.epochs} | Max length: {args.max_length}")
 
-    # Phase 3 + light cleaning
-    logger.info(f"Loading data from {args.data}")
-    import os
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    validate_args(args)
+    args.data = args.data.resolve()
+    args.out_dir = args.out_dir.resolve()
+    args.checkpoint_dir = args.checkpoint_dir.resolve()
 
-    print("Dataset path:", args.data)
-    print("Exists:", os.path.exists(args.data))
-    df = load_data(args.data)
+    if not args.data.is_file():
+        raise FileNotFoundError(f"Dataset not found: {args.data}")
+
+    start = time.time()
+    device = "cuda" if torch.cuda.is_available() else (
+        "mps" if torch.backends.mps.is_available() else "cpu"
+    )
+    logger.info("Using device: %s", device)
+    logger.info("Loading data from %s", args.data)
+
+    df = load_data(str(args.data))
     df["clean_review"] = df["review"].apply(light_clean)
-    logger.info(f"Loaded {len(df)} rows")
 
-    le = LabelEncoder()
-    y = le.fit_transform(df["sentiment"])
-    num_labels = len(le.classes_)
+    label_encoder = LabelEncoder()
+    labels = label_encoder.fit_transform(df["sentiment"])
+    if len(label_encoder.classes_) < 2:
+        raise ValueError("At least two sentiment classes are required.")
 
-    X_train_text, X_test_text, y_train, y_test = train_test_split(
-        df["clean_review"].tolist(), y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    train_text, test_text, train_y, test_y = train_test_split(
+        df["clean_review"].tolist(), labels, test_size=0.2,
+        random_state=RANDOM_STATE, stratify=labels,
     )
-    # carve a small validation split out of train for early stopping
-    X_train_text, X_val_text, y_train, y_val = train_test_split(
-        X_train_text, y_train, test_size=0.1, random_state=RANDOM_STATE, stratify=y_train
+    train_text, val_text, train_y, val_y = train_test_split(
+        train_text, train_y, test_size=0.1,
+        random_state=RANDOM_STATE, stratify=train_y,
     )
 
-    logger.info(f"Train: {len(X_train_text)} | Val: {len(X_val_text)} | Test: {len(X_test_text)}")
+    logger.info("Train: %d | Val: %d | Test: %d", len(train_text), len(val_text), len(test_text))
 
-    logger.info(f"Loading tokenizer + model: {args.model}")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForSequenceClassification.from_pretrained(
         args.model,
-        num_labels=num_labels,
-        id2label={i: c for i, c in enumerate(le.classes_)},
-        label2id={c: i for i, c in enumerate(le.classes_)},
+        num_labels=len(label_encoder.classes_),
+        id2label={i: label for i, label in enumerate(label_encoder.classes_)},
+        label2id={label: i for i, label in enumerate(label_encoder.classes_)},
     )
-    logger.info(f"Model loaded with {num_labels} labels: {list(le.classes_)}")
 
     def tokenize(texts):
         return tokenizer(
-            texts, truncation=True, padding="max_length", max_length=args.max_length, return_tensors="pt"
+            texts, truncation=True, padding="max_length",
+            max_length=args.max_length, return_tensors="pt",
         )
 
-    train_dataset = ReviewDataset(tokenize(X_train_text), y_train)
-    val_dataset = ReviewDataset(tokenize(X_val_text), y_val)
-    test_dataset = ReviewDataset(tokenize(X_test_text), y_test)
+    train_dataset = ReviewDataset(tokenize(train_text), train_y)
+    val_dataset = ReviewDataset(tokenize(val_text), val_y)
+    test_dataset = ReviewDataset(tokenize(test_text), test_y)
 
     training_args = TrainingArguments(
-        output_dir="../models/transformer_checkpoints",
+        output_dir=str(args.checkpoint_dir),
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
@@ -198,48 +176,44 @@ def main():
 
     logger.info("Starting fine-tuning...")
     trainer.train()
-    logger.info("Fine-tuning complete.")
 
-    # Phase 8: evaluate on the held-out test set
-    logger.info("Evaluating on test set...")
-    preds_output = trainer.predict(test_dataset)
-    preds = np.argmax(preds_output.predictions, axis=1)
+    result = trainer.predict(test_dataset)
+    predictions = np.argmax(result.predictions, axis=1)
+    accuracy = accuracy_score(test_y, predictions)
+    precision = precision_score(test_y, predictions, average="weighted", zero_division=0)
+    recall = recall_score(test_y, predictions, average="weighted", zero_division=0)
+    f1 = f1_score(test_y, predictions, average="weighted", zero_division=0)
+    matrix = confusion_matrix(test_y, predictions)
+    report = classification_report(test_y, predictions, target_names=label_encoder.classes_, zero_division=0)
 
-    acc = accuracy_score(y_test, preds)
-    prec = precision_score(y_test, preds, average="weighted", zero_division=0)
-    rec = recall_score(y_test, preds, average="weighted", zero_division=0)
-    f1 = f1_score(y_test, preds, average="weighted", zero_division=0)
-    cm = confusion_matrix(y_test, preds)
-    report = classification_report(y_test, preds, target_names=le.classes_, zero_division=0)
-
-    logger.info(f"=== {args.model} (fine-tuned) ===")
-    logger.info(f"Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}")
-    logger.info(f"Confusion Matrix:\n{cm}")
-    logger.info(f"Classification Report:\n{report}")
-
-    report_lines += [
-        f"\n=== {args.model} (fine-tuned) ===",
-        f"Accuracy: {acc:.4f} | Precision: {prec:.4f} | Recall: {rec:.4f} | F1: {f1:.4f}",
-        f"Confusion Matrix:\n{cm}",
+    report_text = "\n".join([
+        f"Model: {args.model}",
+        f"Epochs: {args.epochs}",
+        f"Max length: {args.max_length}",
+        f"Accuracy: {accuracy:.4f}",
+        f"Precision: {precision:.4f}",
+        f"Recall: {recall:.4f}",
+        f"F1: {f1:.4f}",
+        "Confusion Matrix:",
+        str(matrix),
+        "Classification Report:",
         report,
-    ]
+    ])
 
-    # Phase 10: save model + tokenizer + label encoder
-    os.makedirs(args.out_dir, exist_ok=True)
-    trainer.save_model(args.out_dir)
-    tokenizer.save_pretrained(args.out_dir)
-    joblib.dump(le, os.path.join(args.out_dir, "label_encoder.pkl"))
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    trainer.save_model(str(args.out_dir))
+    tokenizer.save_pretrained(str(args.out_dir))
+    joblib.dump(label_encoder, args.out_dir / "label_encoder.pkl")
+    (args.out_dir / "evaluation_report.txt").write_text(report_text, encoding="utf-8")
 
-    with open(os.path.join(args.out_dir, "evaluation_report.txt"), "w") as f:
-        f.write("\n".join(report_lines))
-
-    logger.info(f"Saved fine-tuned model, tokenizer, and label encoder to {args.out_dir}/")
-    logger.info(f"Total time: {time.time() - t0:.1f}s")
+    logger.info("Saved model artifacts to %s", args.out_dir)
+    logger.info("Total time: %.1fs", time.time() - start)
+    return 0
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except Exception:
         logger.exception("Training run failed with an unhandled exception.")
         raise
